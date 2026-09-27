@@ -10,7 +10,11 @@ import sys
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from errors import ApiError
+from ledger import CompensationLedger
+from pricing import CompensationPolicy
 
 DB_PATH = Path(__file__).with_name("data.db")
 
@@ -23,9 +27,8 @@ def j(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message); self.status, self.message = status, message
+# Re-exported so existing imports (`from app import ApiError`) keep working.
+__all__ = ["ApiError", "RecallService", "Store"]
 
 
 class Store:
@@ -104,6 +107,12 @@ class Store:
 class RecallService:
     def __init__(self, store: Store):
         self.store, self.conn = store, store.conn
+        # Compensation policy (rates) and ledger (claims) are separate modules;
+        # this service only wires the lifecycle events between them.
+        self.policy = CompensationPolicy(self.conn, store.audit)
+        self.ledger = CompensationLedger(self.conn, store.audit, self.policy)
+        self.policy.init_schema()
+        self.ledger.init_schema()
 
     @staticmethod
     def _actor(actor: str | None, role: str | None, allowed: set[str]) -> str:
@@ -257,13 +266,52 @@ class RecallService:
         repair = self._row("repairs", repair_id)
         if repair["status"] != "reported": raise ApiError(409, "维修记录已经复核")
         new_status = "confirmed" if decision == "confirm" and repair["evidence_consistent"] else "flagged"
+        if new_status == "confirmed":
+            vehicle = self._row("vehicles", repair["vehicle_id"])
+            # Fail fast: a confirm with no configured rate must not silently
+            # leave a confirmed repair without a compensation claim.
+            self.policy.quote(repair["remedy_version"], vehicle["model"], vehicle["country"])
         with self.conn:
             self.conn.execute("UPDATE repairs SET status=?,reviewed_by=?,reviewed_at=?,review_note=? WHERE id=?", (new_status, actor, now(), note, repair_id))
             if new_status == "flagged":
                 self.conn.execute("UPDATE parts SET available=available+1 WHERE recall_id=? AND dealer_id=? AND remedy_version=?",
                                   (repair["recall_id"], repair["dealer_id"], repair["remedy_version"]))
             self.store.audit(actor, "repair.review", "repair", repair_id, {"decision": decision, "status": new_status, "note": note})
-        return dict(self._row("repairs", repair_id))
+        result = dict(self._row("repairs", repair_id))
+        if new_status == "confirmed":
+            # Repair confirmation is the trigger; ledger stays idempotent.
+            result["compensation_claim"] = self.ledger.on_repair_confirmed(actor, self._row("repairs", repair_id))
+        return result
+
+    # ---- compensation: thin orchestration over policy + ledger -------------
+
+    def set_compensation_standard(self, actor, role, remedy_version, model, country, amount, currency="CNY") -> dict:
+        standard = self.policy.set_standard(actor, role, remedy_version, model, country, amount, currency)
+        # Rate change: every claim the regulator has not confirmed is re-priced.
+        repriced = self.ledger.reprice_pending(actor or "system", "赔付口径变化，重新核价")
+        standard["repriced_claims"] = repriced
+        return standard
+
+    def list_compensation_standards(self) -> dict:
+        return {"standards": self.policy.list_standards()}
+
+    def claim_detail(self, claim_id: int) -> dict:
+        return self.ledger.claim_detail(claim_id)
+
+    def dealer_ledger(self, actor, role, dealer_id=None) -> dict:
+        return self.ledger.dealer_summary(actor, role, dealer_id)
+
+    def review_claim(self, actor, role, claim_id, decision, note="") -> dict:
+        return self.ledger.review_claim(actor, role, claim_id, decision, note)
+
+    def resubmit_claim(self, actor, role, claim_id, note="", evidence_hash="") -> dict:
+        return self.ledger.resubmit_claim(actor, role, claim_id, note, evidence_hash)
+
+    def settle_claim(self, actor, role, claim_id) -> dict:
+        return self.ledger.settle_claim(actor, role, claim_id)
+
+    def amend_repair_documents(self, actor, role, repair_id, evidence_hash) -> dict:
+        return self.ledger.amend_repair_documents(actor, role, repair_id, evidence_hash)
 
     def _create_release_artifacts(self, recall_id: int, scope_version: int, actor: str) -> None:
         recall = self._row("recalls", recall_id); scope = json.loads(recall["scope_json"])
@@ -317,14 +365,23 @@ class RecallService:
         return {"dealers": [dict(row) for row in self.conn.execute("SELECT * FROM dealers ORDER BY id")],
                 "vehicles": [dict(row) for row in self.conn.execute("SELECT * FROM vehicles ORDER BY id")],
                 "recalls": [self._recall_dict(row) for row in self.conn.execute("SELECT * FROM recalls ORDER BY id DESC")],
+                "compensation_standards": self.policy.list_standards(),
                 "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
 
     def seed(self) -> None:
         if not self.conn.execute("SELECT id FROM dealers LIMIT 1").fetchone():
             self.register_dealer("regulator-demo", "regulator", "D-CN", "演示中心", "CN")
+            self.register_dealer("regulator-demo", "regulator", "D-SG", "新加坡中心", "SG")
         if not self.conn.execute("SELECT id FROM recalls LIMIT 1").fetchone():
-            recall = self.create_recall("maker-demo", "manufacturer", "RC-2026-001", "制动管路检查", {"models": ["X1"], "model_years": [2018, 2019], "vin_prefixes": ["LX"], "countries": ["CN"]}, {"version": 1, "description": "更换制动管"})
-            self.submit_recall("maker-demo", "manufacturer", recall["id"], recall["revision"])
+            recall = self.create_recall("maker-demo", "manufacturer", "RC-2026-001", "制动管路检查", {"models": ["X1"], "model_years": [2018, 2019], "vin_prefixes": ["LX"], "countries": ["CN", "SG"]}, {"version": 1, "description": "更换制动管"})
+            submitted = self.submit_recall("maker-demo", "manufacturer", recall["id"], recall["revision"])
+            published = self.review_recall("regulator-demo", "regulator", submitted["id"], "publish", submitted["revision"], "同意发布")
+            self.policy.set_standard("maker-demo", "manufacturer", 1, "X1", "CN", 1200, "CNY")
+            self.policy.set_standard("maker-demo", "manufacturer", 1, "X1", "SG", 250, "SGD")
+            self.add_parts("maker-demo", "manufacturer", published["id"], 1, 1, 1)
+            self.register_vehicle("maker-demo", "manufacturer", "LXDEMO1", "X1", 2018, "CN", "演示车主")
+            reported = self.report_repair("dealer-demo", "dealer", published["id"], "LXDEMO1", 1, 1, "sha-demo-001", True, idempotency_key="demo-repair-1")
+            self.review_repair("regulator-demo", "regulator", reported["id"], "confirm", "证据一致")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -345,14 +402,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         try:
+            parsed = urlparse(self.path)
             p = self._parts()
+            qs = parse_qs(parsed.query)
+            actor, role = self.headers.get("X-Actor"), self.headers.get("X-Role")
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
             elif len(p) == 3 and p[:2] == ["api", "recalls"]: out = self.service.recall_detail(int(p[2]))
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "unfinished":
-                out = self.service.unfinished(self.headers.get("X-Actor"), self.headers.get("X-Role"), int(p[2]))
+                out = self.service.unfinished(actor, role, int(p[2]))
+            elif p == ["api", "compensation", "standards"]:
+                out = self.service.list_compensation_standards()
+            elif len(p) == 4 and p[:3] == ["api", "compensation", "claims"]:
+                out = self.service.claim_detail(int(p[3]))
+            elif p == ["api", "compensation", "ledger"]:
+                dealer_id = int(qs["dealer_id"][0]) if qs.get("dealer_id") else None
+                out = self.service.dealer_ledger(actor, role, dealer_id)
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
+            elif p == ["claims"]:
+                page = (Path(__file__).parent / "static" / "claims.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})
@@ -371,6 +440,19 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "parts": out = self.service.add_parts(actor, role, int(p[2]), int(body.get("dealer_id", 0)), int(body.get("remedy_version", 0)), int(body.get("quantity", 0)))
             elif p == ["api", "repairs"]: out = self.service.report_repair(actor, role, int(body.get("recall_id", 0)), body.get("vin", ""), int(body.get("dealer_id", 0)), int(body.get("remedy_version", 0)), body.get("evidence_hash", ""), bool(body.get("evidence_consistent", True)), body.get("border_permit", ""), body.get("idempotency_key", ""))
             elif len(p) == 4 and p[:2] == ["api", "repairs"] and p[3] == "review": out = self.service.review_repair(actor, role, int(p[2]), body.get("decision", ""), body.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "repairs"] and p[3] == "documents": out = self.service.amend_repair_documents(actor, role, int(p[2]), body.get("evidence_hash", ""))
+            elif p == ["api", "compensation", "standards"]:
+                out = self.service.set_compensation_standard(actor, role, int(body.get("remedy_version", 0)), body.get("model", ""), body.get("country", ""), int(body.get("amount", -1)), body.get("currency", "CNY"))
+            elif len(p) == 5 and p[:3] == ["api", "compensation", "claims"] and p[4] in ("review", "resubmit", "settle"):
+                action = {"review": self.service.review_claim,
+                          "resubmit": self.service.resubmit_claim,
+                          "settle": self.service.settle_claim}[p[4]]
+                if p[4] == "review":
+                    out = action(actor, role, int(p[3]), body.get("decision", ""), body.get("note", ""))
+                elif p[4] == "resubmit":
+                    out = action(actor, role, int(p[3]), body.get("note", ""), body.get("evidence_hash", ""))
+                else:
+                    out = action(actor, role, int(p[3]))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})

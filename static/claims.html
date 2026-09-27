@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>网点赔付台账</title>
+<style>
+  body{font:15px/1.5 system-ui,"PingFang SC","Microsoft YaHei",sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#1f2933}
+  h1{font-size:22px;margin-bottom:4px}
+  .sub{color:#64707d;margin-top:0}
+  a{color:#0b6bcb}
+  .bar{display:flex;gap:10px;align-items:center;margin:16px 0;flex-wrap:wrap}
+  select,input,button,textarea{font:inherit;padding:6px 10px;border:1px solid #b7c0ca;border-radius:6px;background:#fff}
+  button{cursor:pointer}
+  button.primary{background:#0b6bcb;color:#fff;border-color:#0b6bcb}
+  .dealer{border:1px solid #d8dee4;border-radius:10px;margin:18px 0;overflow:hidden}
+  .dealer h2{font-size:16px;margin:0;padding:12px 16px;background:#f6f8fa;display:flex;justify-content:space-between;align-items:center}
+  .totals{display:flex;gap:0;border-bottom:1px solid #d8dee4}
+  .totals div{flex:1;padding:10px 16px;border-right:1px solid #e5e9ee}
+  .totals div:last-child{border-right:0}
+  .totals .k{font-size:12px;color:#64707d}
+  .totals .v{font-size:18px;font-weight:600}
+  .v.approved{color:#1a7f37}.v.pending{color:#9a6700}.v.disputed{color:#c0392b}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:8px 10px;border-bottom:1px solid #ecf0f3;text-align:left;vertical-align:top}
+  th{background:#fafbfc;color:#57606a;font-weight:600;white-space:nowrap}
+  .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px}
+  .tag.approved{background:#daf4e3;color:#1a7f37}
+  .tag.pending{background:#fdf3d3;color:#9a6700}
+  .tag.rejected{background:#fbe1de;color:#c0392b}
+  .tag.paid{background:#e3e8ef;color:#44505f;margin-left:4px}
+  details{margin:6px 0}
+  summary{cursor:pointer;color:#0b6bcb}
+  .hist{margin:6px 0 0;padding-left:18px;font-size:12px;color:#44505f}
+  .hist li{margin:3px 0}
+  .reason{color:#c0392b}
+  .row-actions{display:flex;gap:6px;flex-wrap:wrap}
+  .std{border:1px solid #d8dee4;border-radius:10px;padding:10px 16px;background:#fafbfc;margin:14px 0}
+  .std table{font-size:12px}
+  #msg{color:#c0392b;min-height:20px}
+  code{background:#f0f3f6;padding:1px 5px;border-radius:4px;font-size:12px}
+</style>
+</head>
+<body>
+<h1>网点垫付赔付台账</h1>
+<p class="sub">维修确认后自动按「完成时方案 / 车型 / 车辆所在国家」核价生成赔付申请；监管确认前口径或单据变化会重新核价；同一维修单仅一笔申请。<a href="/">← 返回召回跟踪</a></p>
+
+<div class="bar">
+  <label>身份
+    <select id="role">
+      <option value="dealer">网点 dealer</option>
+      <option value="regulator" selected>监管 regulator</option>
+      <option value="manufacturer">厂家 manufacturer</option>
+    </select>
+  </label>
+  <input id="actor" value="regulator-demo" size="18" title="X-Actor">
+  <label>只看网点
+    <select id="dealerFilter"><option value="">全部网点</option></select>
+  </label>
+  <button class="primary" onclick="load()">刷新</button>
+  <span id="msg"></span>
+</div>
+
+<div class="std">
+  <strong>现行赔付口径</strong>（独立维护：<code>pricing.py</code>；变更后待核申请自动重新核价）
+  <table id="stdTable"><thead><tr><th>方案版本</th><th>车型</th><th>国家</th><th>标准额</th><th>更新时间</th></tr></thead><tbody></tbody></table>
+</div>
+
+<div id="dealers"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const headers = () => ({'Content-Type':'application/json','X-Actor':$('actor').value||'x','X-Role':$('role').value});
+
+function money(a, c){ return (Number(a||0)).toLocaleString() + ' ' + (c||''); }
+const STATUS = {pending:['pending','待核'], approved:['approved','可赔'], rejected:['rejected','争议']};
+
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const data = await r.json();
+  if(!r.ok) throw new Error(data.error || ('HTTP '+r.status));
+  return data;
+}
+
+function claimRow(c){
+  const [cls,label] = STATUS[c.status];
+  const tags = `<span class="tag ${cls}">${label}</span>` + (c.paid ? '<span class="tag paid">已付</span>' : '');
+  const hist = c.revisions.map(h =>
+    `<li><b>${h.event}</b> 账页v${h.revision}：` +
+    `${h.amount_before===null?'—':money(h.amount_before,c.currency)} → ${money(h.amount_after,c.currency)}` +
+    `（${h.actor}，${h.created_at}）${h.reason?' — '+h.reason:''}</li>`).join('');
+  let actions = '';
+  const role = $('role').value;
+  if(role==='regulator' && c.status==='pending'){
+    actions = `<div class="row-actions">
+      <button onclick="decide(${c.id},'approve')">确认通过</button>
+      <button onclick="rejectClaim(${c.id})">驳回</button></div>`;
+  }
+  if(role==='dealer' && c.status==='rejected'){
+    actions = `<div class="row-actions"><button onclick="resubmit(${c.id})">更正重提</button></div>`;
+  }
+  if(role==='manufacturer' && c.status==='approved' && !c.paid){
+    actions = `<div class="row-actions"><button onclick="settle(${c.id})">付款</button></div>`;
+  }
+  return `<tr>
+    <td>#${c.id}<br><small>维修单 #${c.repair_id}</small></td>
+    <td>${c.vin}<br><small>${c.model} · v${c.remedy_version} · ${c.country}</small></td>
+    <td>${money(c.amount,c.currency)}<br><small>单据 <code>${(c.evidence_hash||'').slice(0,12)}</code></small></td>
+    <td>${tags}${c.reject_reason?`<div class="reason">驳回原因：${c.reject_reason}</div>`:''}
+        ${c.settled_at?`<div>付款：${c.settled_at}</div>`:''}
+        <details><summary>账页 ${c.revisions.length} 条</summary><ul class="hist">${hist}</ul></details></td>
+    <td>${actions}</td>
+  </tr>`;
+}
+
+function dealerBlock(d){
+  return `<div class="dealer">
+    <h2><span>${d.dealer_code} · ${d.dealer_name}（${d.country}）</span><span>${d.claims.length} 笔申请</span></h2>
+    <div class="totals">
+      <div><div class="k">可赔（监管已确认，待/已付）</div><div class="v approved">${money(d.approved_total,d.currency)}</div>
+        <small>已付 ${money(d.paid_total,d.currency)} · 待付 ${money(d.net_payable,d.currency)}</small></div>
+      <div><div class="k">待核（监管确认前）</div><div class="v pending">${money(d.pending_total,d.currency)}</div></div>
+      <div><div class="k">争议（被驳回，可更正重提）</div><div class="v disputed">${money(d.disputed_total,d.currency)}</div></div>
+    </div>
+    <table><thead><tr><th>申请/维修单</th><th>车辆与计价依据</th><th>金额/单据</th><th>状态与账页</th><th>操作</th></tr></thead>
+      <tbody>${d.claims.map(claimRow).join('') || '<tr><td colspan="5">暂无申请</td></tr>'}</tbody></table>
+  </div>`;
+}
+
+async function load(){
+  $('msg').textContent = '';
+  try{
+    const filter = $('dealerFilter').value;
+    const [ledger, stds] = await Promise.all([
+      api('/api/compensation/ledger'+(filter?`?dealer_id=${filter}`:'')),
+      api('/api/compensation/standards')
+    ]);
+    $('stdTable').querySelector('tbody').innerHTML = stds.standards.map(s =>
+      `<tr><td>v${s.remedy_version}</td><td>${s.model}</td><td>${s.country}</td>
+       <td><b>${money(s.amount,s.currency)}</b></td><td>${s.updated_at}</td></tr>`).join('')
+       || '<tr><td colspan="5">尚未配置口径</td></tr>';
+    $('dealers').innerHTML = ledger.dealers.map(dealerBlock).join('') || '<p>该网点暂无赔付申请。</p>';
+    if(!$('dealerFilter').dataset.filled){
+      const all = await api('/api/compensation/ledger');
+      $('dealerFilter').insertAdjacentHTML('beforeend',
+        all.dealers.map(d=>`<option value="${d.dealer_id}">${d.dealer_code} ${d.dealer_name}</option>`).join(''));
+      $('dealerFilter').dataset.filled='1';
+    }
+  }catch(e){ $('msg').textContent = e.message; }
+}
+
+async function decide(id, decision){
+  const note = decision==='reject' ? (prompt('驳回原因（旧金额与原因会保留在账页）')||'') : '';
+  if(decision==='reject' && !note) return;
+  try{ await api(`/api/compensation/claims/${id}/review`,{method:'POST',headers:headers(),body:JSON.stringify({decision,note})}); load(); }
+  catch(e){ alert(e.message); }
+}
+async function resubmit(id){
+  const note = prompt('更正说明（可留空；可在 API 中同时提交新单据哈希）','网点已更正单据') ?? '';
+  try{ await api(`/api/compensation/claims/${id}/resubmit`,{method:'POST',headers:headers(),body:JSON.stringify({note})}); load(); }
+  catch(e){ alert(e.message); }
+}
+async function settle(id){
+  try{ await api(`/api/compensation/claims/${id}/settle`,{method:'POST',headers:headers(),body:'{}'}); load(); }
+  catch(e){ alert(e.message); }
+}
+$('role').addEventListener('change', () => { $('actor').value = $('role').value+'-demo'; load(); });
+$('dealerFilter').addEventListener('change', load);
+load();
+</script>
+</body>
+</html>

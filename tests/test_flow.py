@@ -13,9 +13,13 @@ class RecallFlowTest(unittest.TestCase):
     def tearDown(self): self.s.store.close(); self.tmp.cleanup()
 
     def make_recall(self):
-        r = self.s.create_recall("maker", "manufacturer", "RC-1", "制动检查", {"models": ["X"], "model_years": [2018], "vin_prefixes": ["LX"], "countries": ["CN"]}, {"version": 1, "description": "更换软管"})
+        r = self.s.create_recall("maker", "manufacturer", "RC-1", "制动检查", {"models": ["X"], "model_years": [2018], "vin_prefixes": ["LX"], "countries": ["CN", "SG"]}, {"version": 1, "description": "更换软管"})
         r = self.s.submit_recall("maker", "manufacturer", r["id"], r["revision"])
-        return self.s.review_recall("reg", "regulator", r["id"], "publish", r["revision"], "同意发布")
+        published = self.s.review_recall("reg", "regulator", r["id"], "publish", r["revision"], "同意发布")
+        # Repair confirmation prices a claim against current compensation rates.
+        self.s.set_compensation_standard("maker", "manufacturer", 1, "X", "CN", 800, "CNY")
+        self.s.set_compensation_standard("maker", "manufacturer", 1, "X", "SG", 200, "SGD")
+        return published
 
     def test_publish_cross_border_repair_scope_change_and_unfinished(self):
         recall = self.make_recall()
