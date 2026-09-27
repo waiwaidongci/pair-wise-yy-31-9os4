@@ -10,22 +10,13 @@ import sys
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from core import ApiError, j, now
+from ledger import ClaimLedger
+from standards import StandardBook
 
 DB_PATH = Path(__file__).with_name("data.db")
-
-
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def j(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message); self.status, self.message = status, message
 
 
 class Store:
@@ -104,6 +95,8 @@ class Store:
 class RecallService:
     def __init__(self, store: Store):
         self.store, self.conn = store, store.conn
+        self.claim_hook = None     # 维修确认后生成赔付申请（账本模块接线）
+        self.evidence_hook = None  # 维修单据变更后重新核价
 
     @staticmethod
     def _actor(actor: str | None, role: str | None, allowed: set[str]) -> str:
@@ -263,6 +256,20 @@ class RecallService:
                 self.conn.execute("UPDATE parts SET available=available+1 WHERE recall_id=? AND dealer_id=? AND remedy_version=?",
                                   (repair["recall_id"], repair["dealer_id"], repair["remedy_version"]))
             self.store.audit(actor, "repair.review", "repair", repair_id, {"decision": decision, "status": new_status, "note": note})
+            if new_status == "confirmed" and self.claim_hook:
+                self.claim_hook(repair_id, actor)
+        return dict(self._row("repairs", repair_id))
+
+    def update_repair_evidence(self, actor: str | None, role: str | None, repair_id: int, evidence_hash: str, evidence_consistent: bool) -> dict:
+        actor = self._actor(actor, role, {"dealer"})
+        if not evidence_hash: raise ApiError(400, "证据哈希不能为空")
+        repair = self._row("repairs", repair_id)
+        if repair["reported_by"] != actor: raise ApiError(403, "只能更正本网点提交的维修单")
+        if repair["status"] not in ("reported", "confirmed"): raise ApiError(409, "当前状态不可更正单据")
+        with self.conn:
+            self.conn.execute("UPDATE repairs SET evidence_hash=?,evidence_consistent=? WHERE id=?", (evidence_hash, int(evidence_consistent), repair_id))
+            self.store.audit(actor, "repair.evidence", "repair", repair_id, {"evidence_hash": evidence_hash, "evidence_consistent": bool(evidence_consistent)})
+            if self.evidence_hook: self.evidence_hook(repair_id, actor)
         return dict(self._row("repairs", repair_id))
 
     def _create_release_artifacts(self, recall_id: int, scope_version: int, actor: str) -> None:
@@ -329,6 +336,7 @@ class RecallService:
 
 class Handler(BaseHTTPRequestHandler):
     service: RecallService
+    ledger: ClaimLedger
 
     def log_message(self, fmt: str, *args: object) -> None: sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
@@ -343,16 +351,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def _parts(self) -> list[str]: return [p for p in urlparse(self.path).path.strip("/").split("/") if p]
 
+    def _query_id(self, key: str) -> int | None:
+        raw = parse_qs(urlparse(self.path).query).get(key, [""])[0]
+        if not raw: return None
+        try: return int(raw)
+        except ValueError as exc: raise ApiError(400, f"参数 {key} 无效") from exc
+
+    def _query_str(self, key: str) -> str:
+        return parse_qs(urlparse(self.path).query).get(key, [""])[0]
+
     def do_GET(self) -> None:
         try:
             p = self._parts()
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
+            elif p == ["api", "standards"]: out = {"standards": self.ledger.list_standards()}
+            elif p == ["api", "claims", "summary"]: out = self.ledger.summary(self._query_id("dealer_id"))
+            elif p == ["api", "claims"]: out = {"claims": self.ledger.list_claims(self._query_id("dealer_id"), self._query_str("state"))}
+            elif len(p) == 3 and p[:2] == ["api", "claims"]: out = self.ledger.get_claim(int(p[2]))
             elif len(p) == 3 and p[:2] == ["api", "recalls"]: out = self.service.recall_detail(int(p[2]))
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "unfinished":
                 out = self.service.unfinished(self.headers.get("X-Actor"), self.headers.get("X-Role"), int(p[2]))
-            elif not p:
-                page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
+            elif p in ([], ["claims"]):
+                name = "claims.html" if p else "index.html"
+                page = (Path(__file__).parent / "static" / name).read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})
@@ -371,6 +393,11 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "parts": out = self.service.add_parts(actor, role, int(p[2]), int(body.get("dealer_id", 0)), int(body.get("remedy_version", 0)), int(body.get("quantity", 0)))
             elif p == ["api", "repairs"]: out = self.service.report_repair(actor, role, int(body.get("recall_id", 0)), body.get("vin", ""), int(body.get("dealer_id", 0)), int(body.get("remedy_version", 0)), body.get("evidence_hash", ""), bool(body.get("evidence_consistent", True)), body.get("border_permit", ""), body.get("idempotency_key", ""))
             elif len(p) == 4 and p[:2] == ["api", "repairs"] and p[3] == "review": out = self.service.review_repair(actor, role, int(p[2]), body.get("decision", ""), body.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "repairs"] and p[3] == "evidence": out = self.service.update_repair_evidence(actor, role, int(p[2]), body.get("evidence_hash", ""), bool(body.get("evidence_consistent", True)))
+            elif p == ["api", "standards"]: out = self.ledger.set_standard(actor, role, int(body.get("remedy_version", 0)), body.get("model", ""), body.get("country", ""), int(body.get("amount_cents", 0)), body.get("currency", "CNY"), body.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "claims"] and p[3] == "review": out = self.ledger.review_claim(actor, role, int(p[2]), body.get("decision", ""), body.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "claims"] and p[3] == "resubmit": out = self.ledger.resubmit(actor, role, int(p[2]), body.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "claims"] and p[3] == "pay": out = self.ledger.pay(actor, role, int(p[2]))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})
@@ -380,8 +407,14 @@ class Handler(BaseHTTPRequestHandler):
 
 def run(port: int, db_path: str, seed: bool) -> None:
     store = Store(db_path); service = RecallService(store)
-    if seed: service.seed()
-    Handler.service = service
+    standards = StandardBook(store.conn); standards.init_schema()
+    ledger = ClaimLedger(store.conn, standards); ledger.init_schema()
+    service.claim_hook = ledger.create_claim_for_repair
+    service.evidence_hook = lambda repair_id, actor: ledger.reprice_for_repair(repair_id, actor, "维修单据变更，重新核价")
+    if seed:
+        service.seed()
+        if not standards.list_all(): ledger.set_standard("maker-demo", "manufacturer", 1, "X1", "CN", 120000, "CNY", "演示口径")
+    Handler.service = service; Handler.ledger = ledger
     print(f"vehicle recall listening on http://127.0.0.1:{port}")
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 

@@ -1,0 +1,21 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>召回赔付台账</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}table{border-collapse:collapse;width:100%;margin:12px 0 32px}td,th{border:1px solid #d0d7de;padding:6px 10px;text-align:left;font-size:14px}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:12px 0}.card{border:1px solid #d0d7de;border-radius:8px;padding:10px 16px;min-width:130px}.card b{display:block;font-size:20px;margin:4px 0}.payable b{color:#1a7f37}.pending b{color:#bf8700}.disputed b{color:#cf222e}.paid b{color:#57606a}button{padding:8px 14px}h2{margin-top:32px}</style><h1>召回赔付台账</h1><p>按维修网点汇总：可赔（监管已确认）、待核（等待监管确认）、争议（被驳回待更正）与已付。金额单位为元。</p><p><a href="/">返回召回跟踪</a> <button onclick="loadSummary()">刷新</button></p><div id="app">加载中...</div><script>
+const STATE={pending:"待核",approved:"可赔",rejected:"争议",paid:"已付"};
+const money=c=>(c/100).toFixed(2);
+async function loadSummary(){
+  const data=await (await fetch('/api/claims/summary')).json();
+  const el=document.getElementById('app');el.innerHTML='';
+  for(const d of data.dealers){
+    const sec=document.createElement('section');
+    sec.innerHTML=`<h2>${d.name}（${d.code} / ${d.country}）</h2><div class="cards">
+      <div class="card payable">可赔<b>${money(d.payable_cents)}</b>${d.payable_count} 笔</div>
+      <div class="card pending">待核<b>${money(d.pending_cents)}</b>${d.pending_count} 笔</div>
+      <div class="card disputed">争议<b>${money(d.disputed_cents)}</b>${d.disputed_count} 笔</div>
+      <div class="card paid">已付<b>${money(d.paid_cents)}</b>${d.paid_count} 笔</div></div>`;
+    if(d.claims.length){
+      const rows=d.claims.map(c=>`<tr><td>${c.id}</td><td>${c.repair_id}</td><td>${c.vin}</td><td>${c.campaign_code}</td><td>${c.model}</td><td>${c.country}</td><td>v${c.remedy_version}</td><td>${STATE[c.state]||c.state}</td><td>${money(c.amount_cents)} ${c.currency}</td><td>${c.standard_version?'口径v'+c.standard_version:'待定价'}</td><td>第${c.version}次</td><td>${c.decision_note||''}</td></tr>`).join('');
+      sec.innerHTML+=`<table><tr><th>申请</th><th>维修单</th><th>VIN</th><th>召回</th><th>车型</th><th>国家</th><th>方案</th><th>状态</th><th>金额</th><th>口径</th><th>提交</th><th>最近说明</th></tr>${rows}</table>`;
+    }
+    el.appendChild(sec);
+  }
+}
+loadSummary()</script></html>
